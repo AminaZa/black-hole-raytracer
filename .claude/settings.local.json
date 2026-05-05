@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python examples/flat_render.py)"
-    ]
-  }
-}

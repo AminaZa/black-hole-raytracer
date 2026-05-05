@@ -1,20 +1,10 @@
-"""Flat-spacetime render: camera + accretion disk baseline.
+"""Flat-spacetime baseline render.
 
-Scene
------
-* Camera at (0, 5, −15) aimed at the origin, 45° vertical FOV.
-* Accretion disk in the equatorial plane (y = 0),
-  inner_radius = 3, outer_radius = 12.
-* 800 × 600 pixels, saved to gallery/flat_test.png.
+Camera at (0, 5, -15) looking at the origin, 45 deg FOV.
+Accretion disk in y=0 plane, inner_radius=3, outer_radius=12.
+Output: gallery/flat_test.png (800x600).
 
-This render contains no GR physics — rays travel in straight lines.
-Its purpose is to verify the pinhole camera model and disk geometry
-before the geodesic integrator is introduced.
-
-Usage
------
-Run from the repository root::
-
+Usage:
     python examples/flat_render.py
 """
 
@@ -23,7 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Allow running without ``pip install`` by adding src/ to the path
+# Allow running from the repo root without pip install
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
@@ -34,14 +24,6 @@ from scene.accretion_disk import AccretionDisk
 
 
 def main() -> None:
-    """Build the scene, render, and save the output image."""
-
-    # ------------------------------------------------------------------
-    # Camera
-    # Camera sits above (y = 5) and behind (z = −15) the disk, looking
-    # toward the origin.  This gives a moderate downward viewing angle
-    # (~18°) that shows the disk in perspective without flattening it.
-    # ------------------------------------------------------------------
     camera = Camera(
         position=np.array([0.0, 5.0, -15.0]),
         target=np.array([0.0, 0.0, 0.0]),
@@ -51,23 +33,16 @@ def main() -> None:
         height=600,
     )
 
-    # ------------------------------------------------------------------
-    # Scene objects
-    # inner_radius = 3  matches the Schwarzschild ISCO at r = 6M when
-    # M = 0.5, giving a plausible placeholder gap around the black hole.
-    # ------------------------------------------------------------------
+    # inner_radius=3 approximates the Schwarzschild ISCO gap at r=6M for M=0.5
     disk = AccretionDisk(inner_radius=3.0, outer_radius=12.0)
 
-    # ------------------------------------------------------------------
-    # Renderer
-    # ------------------------------------------------------------------
     renderer = Renderer(
         camera=camera,
         scene_objects=[disk],
-        background_color=np.array([0.02, 0.02, 0.08]),  # deep navy
+        background_color=np.array([0.02, 0.02, 0.08]),
     )
 
-    print("Rendering flat baseline (no GR)…")
+    print("Rendering...")
     image = renderer.render()
 
     output_path = Path(__file__).resolve().parent.parent / "gallery" / "flat_test.png"

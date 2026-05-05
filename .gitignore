@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+*.lcov
+
+# Type checking
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Gallery outputs (keep directory, ignore renders)
+gallery/*.png
+gallery/*.jpg
+gallery/*.jpeg
+gallery/*.exr
+gallery/*.hdr
+!gallery/.gitkeep
+
+# Docs build
+docs/_build/
+docs/.doctrees/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

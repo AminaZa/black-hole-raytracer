@@ -52,8 +52,8 @@ where Γμαβ are Christoffel symbols encoding the curvature of spacetime induc
 > **Prerequisites:** Python 3.10+
 
 ```bash
-git clone https://github.com/yourname/gr-tracer.git
-cd gr-tracer
+git clone https://github.com/AminaZa/black-hole-raytracer.git
+cd black-hole-raytracer
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"

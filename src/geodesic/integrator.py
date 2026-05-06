@@ -6,14 +6,15 @@ Solves the geodesic equation rewritten as a first-order system:
     dp^μ/dλ = -Γ^μ_{αβ} p^α p^β
 
 The integrator is metric-agnostic: it accepts any object exposing ``rs`` and
-``christoffel_symbols(position)``, so swapping a different metric (e.g. Kerr)
-requires no changes here.
+``christoffel_symbols(position)``. If the metric also exposes
+``acceleration(position, momentum)``, the integrator uses that closed-form
+fast path instead of building the full Christoffel tensor each step.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -58,6 +59,9 @@ class GeodesicResult:
     trajectory: NDArray[np.float64] | None = None
 
 
+AccelFn = Callable[[NDArray[np.float64], NDArray[np.float64]], NDArray[np.float64]]
+
+
 class GeodesicIntegrator:
     """RK4 integrator for null (or general) geodesics in any metric.
 
@@ -71,10 +75,13 @@ class GeodesicIntegrator:
         Radial buffer above ``rs``; integration stops at ``r <= rs + horizon_eps``
         to avoid the coordinate singularity.
     base_step:
-        Affine-parameter step used in the far field.
+        Affine-parameter step used in the medium band ``3 rs <= r <= 10 rs``.
     near_field_factor:
-        Step is multiplied by this factor inside ``r < 5 rs`` to resolve the
-        rapidly varying connection there.
+        Step is multiplied by this factor when ``r < 3 rs`` to resolve the
+        rapidly varying connection near the photon sphere.
+    far_field_factor:
+        Step is multiplied by this factor when ``r > 10 rs`` to skip through
+        nearly-flat regions where photon paths are almost straight.
     """
 
     def __init__(
@@ -84,25 +91,47 @@ class GeodesicIntegrator:
         horizon_eps: float = 1e-3,
         base_step: float = 0.2,
         near_field_factor: float = 0.1,
+        far_field_factor: float = 2.0,
     ) -> None:
         self.metric: MetricProtocol = metric
         self.r_max: float = float(r_max)
         self.horizon_eps: float = float(horizon_eps)
         self.base_step: float = float(base_step)
         self.near_field_factor: float = float(near_field_factor)
+        self.far_field_factor: float = float(far_field_factor)
+        self._has_fast_accel: bool = hasattr(metric, "acceleration")
 
     def _step_size(self, r: float) -> float:
         """Adaptive affine-parameter step size based on radial distance."""
-        if r < 5.0 * self.metric.rs:
+        rs = self.metric.rs
+        if r < 3.0 * rs:
             return self.base_step * self.near_field_factor
+        if r > 10.0 * rs:
+            return self.base_step * self.far_field_factor
         return self.base_step
 
     def _accel(
         self, position: NDArray[np.float64], momentum: NDArray[np.float64]
     ) -> NDArray[np.float64]:
         """Compute dp^μ/dλ = -Γ^μ_{αβ} p^α p^β at the given state."""
+        if self._has_fast_accel:
+            return self.metric.acceleration(position, momentum)  # type: ignore[attr-defined]
         gamma: NDArray[np.float64] = self.metric.christoffel_symbols(position)
         return -np.einsum("mab,a,b->m", gamma, momentum, momentum)
+
+    def _build_accel_fn(self) -> AccelFn:
+        """Return a tight closure over the metric's acceleration routine."""
+        metric = self.metric
+        if self._has_fast_accel:
+            return metric.acceleration  # type: ignore[attr-defined,return-value]
+
+        def accel(
+            x: NDArray[np.float64], p: NDArray[np.float64]
+        ) -> NDArray[np.float64]:
+            gamma = metric.christoffel_symbols(x)
+            return -np.einsum("mab,a,b->m", gamma, p, p)
+
+        return accel
 
     def integrate(
         self,
@@ -132,6 +161,15 @@ class GeodesicIntegrator:
             per-ray memory low during rendering.
         """
         rs: float = self.metric.rs
+        r_max: float = self.r_max
+        horizon_eps: float = self.horizon_eps
+        base_step: float = self.base_step
+        step_near: float = base_step * self.near_field_factor
+        step_far: float = base_step * self.far_field_factor
+        rs_3: float = 3.0 * rs
+        rs_10: float = 10.0 * rs
+        half_pi: float = 0.5 * np.pi
+        accel: AccelFn = self._build_accel_fn()
         check_disk: bool = disk_inner is not None and disk_outer is not None
 
         x: NDArray[np.float64] = position.astype(np.float64, copy=True)
@@ -145,47 +183,49 @@ class GeodesicIntegrator:
         for _ in range(max_steps):
             r: float = float(x[1])
 
-            if r <= rs + self.horizon_eps:
+            if r <= rs + horizon_eps:
                 termination = "horizon"
                 break
-            if r >= self.r_max:
+            if r >= r_max:
                 termination = "escape"
                 break
 
-            h: float = self._step_size(r)
+            if r < rs_3:
+                h = step_near
+            elif r > rs_10:
+                h = step_far
+            else:
+                h = base_step
 
-            k1x: NDArray[np.float64] = p
-            k1p: NDArray[np.float64] = self._accel(x, p)
+            half_h: float = 0.5 * h
+            sixth_h: float = h / 6.0
 
-            x2: NDArray[np.float64] = x + 0.5 * h * k1x
-            p2: NDArray[np.float64] = p + 0.5 * h * k1p
-            k2x: NDArray[np.float64] = p2
-            k2p: NDArray[np.float64] = self._accel(x2, p2)
+            k1p = accel(x, p)
+            x2 = x + half_h * p
+            p2 = p + half_h * k1p
 
-            x3: NDArray[np.float64] = x + 0.5 * h * k2x
-            p3: NDArray[np.float64] = p + 0.5 * h * k2p
-            k3x: NDArray[np.float64] = p3
-            k3p: NDArray[np.float64] = self._accel(x3, p3)
+            k2p = accel(x2, p2)
+            x3 = x + half_h * p2
+            p3 = p + half_h * k2p
 
-            x4: NDArray[np.float64] = x + h * k3x
-            p4: NDArray[np.float64] = p + h * k3p
-            k4x: NDArray[np.float64] = p4
-            k4p: NDArray[np.float64] = self._accel(x4, p4)
+            k3p = accel(x3, p3)
+            x4 = x + h * p3
+            p4 = p + h * k3p
 
-            x_next: NDArray[np.float64] = x + (h / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x)
-            p_next: NDArray[np.float64] = p + (h / 6.0) * (k1p + 2.0 * k2p + 2.0 * k3p + k4p)
+            k4p = accel(x4, p4)
+
+            x_next = x + sixth_h * (p + 2.0 * p2 + 2.0 * p3 + p4)
+            p_next = p + sixth_h * (k1p + 2.0 * k2p + 2.0 * k3p + k4p)
 
             theta_prev: float = float(x[2])
             theta_next: float = float(x_next[2])
-            half_pi: float = 0.5 * np.pi
 
             crossed: bool = (theta_prev - half_pi) * (theta_next - half_pi) < 0.0
             if check_disk and crossed:
                 alpha: float = (half_pi - theta_prev) / (theta_next - theta_prev)
-                x_cross: NDArray[np.float64] = x + alpha * (x_next - x)
-                p_cross: NDArray[np.float64] = p + alpha * (p_next - p)
+                x_cross = x + alpha * (x_next - x)
+                p_cross = p + alpha * (p_next - p)
                 r_cross: float = float(x_cross[1])
-                # disk_inner/disk_outer are non-None when check_disk is True.
                 assert disk_inner is not None and disk_outer is not None
                 if disk_inner <= r_cross <= disk_outer:
                     lam += alpha * h

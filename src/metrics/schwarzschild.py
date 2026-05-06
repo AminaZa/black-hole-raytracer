@@ -113,3 +113,50 @@ class SchwarzschildMetric:
         gamma[3, 3, 2] = cot_theta
 
         return gamma
+
+    def acceleration(
+        self,
+        position: NDArray[np.float64],
+        momentum: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Closed-form ``dp^μ/dλ = -Γ^μ_{αβ} p^α p^β`` for Schwarzschild.
+
+        Equivalent to ``-einsum('mab,a,b->m', christoffel_symbols(x), p, p)`` but
+        skips the (4, 4, 4) tensor allocation and the einsum dispatch by inlining
+        the eleven non-zero connection coefficients directly. This is the
+        per-step hot path in the integrator.
+        """
+        r: float = float(position[1])
+        theta: float = float(position[2])
+        rs: float = self.rs
+        M: float = self.mass
+
+        pt: float = float(momentum[0])
+        pr: float = float(momentum[1])
+        pth: float = float(momentum[2])
+        pph: float = float(momentum[3])
+
+        sin_t: float = float(np.sin(theta))
+        cos_t: float = float(np.cos(theta))
+        f: float = 1.0 - rs / r
+        inv_r: float = 1.0 / r
+        r_minus_rs: float = r - rs
+
+        gamma_t_tr: float = M / (r * r_minus_rs)
+        gamma_r_tt: float = (M / (r * r)) * f
+
+        dpt: float = -2.0 * gamma_t_tr * pt * pr
+        dpr: float = -(
+            gamma_r_tt * pt * pt
+            - gamma_t_tr * pr * pr
+            - r_minus_rs * pth * pth
+            - r_minus_rs * sin_t * sin_t * pph * pph
+        )
+        dpth: float = -(
+            2.0 * inv_r * pr * pth
+            - sin_t * cos_t * pph * pph
+        )
+        cot_t: float = cos_t / sin_t
+        dpph: float = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
+
+        return np.array([dpt, dpr, dpth, dpph], dtype=np.float64)

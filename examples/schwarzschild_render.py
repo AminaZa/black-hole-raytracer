@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -46,6 +47,7 @@ def main() -> None:
         horizon_eps=1e-3,
         base_step=0.25,
         near_field_factor=0.1,
+        far_field_factor=2.0,
     )
 
     renderer = CurvedRenderer(
@@ -54,14 +56,17 @@ def main() -> None:
         integrator=integrator,
         scene_objects=[disk],
         background_color=np.array([0.02, 0.02, 0.08]),
-        progress_every=5000,
     )
 
     print(f"Rendering Schwarzschild scene (M={metric.mass}, rs={rs})...")
+    wall_start = time.perf_counter()
     image = renderer.render()
+    wall_elapsed = time.perf_counter() - wall_start
 
     output_path = Path(__file__).resolve().parent.parent / "gallery" / "schwarzschild_test.png"
     renderer.save_png(image, output_path)
+
+    print(f"Total render time: {wall_elapsed:.2f}s ({wall_elapsed / 60:.2f} min)")
 
 
 if __name__ == "__main__":

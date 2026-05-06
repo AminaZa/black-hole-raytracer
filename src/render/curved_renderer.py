@@ -6,12 +6,16 @@ hand it to the geodesic integrator, and colour the pixel based on what the
 ray hit (event horizon → black, equatorial disk → disk colour, escape →
 background).
 
-The render loop is per-ray Python and is intentionally slow; it is the
-correctness baseline for the vectorised renderer that comes in Phase 3.
+The render loop fans pixels out across a ``multiprocessing.Pool`` so each
+worker advances its own batch of rays in parallel. Initial conditions
+(spherical-frame projection and null 4-momentum) are computed vectorised in
+the master before chunks are dispatched, so workers do nothing but RK4.
 """
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -93,6 +97,82 @@ def cartesian_to_spherical_basis(
     return n_r, n_theta, n_phi
 
 
+def _project_basis_batch(
+    directions: NDArray[np.float64], theta: float, phi: float
+) -> NDArray[np.float64]:
+    """Vectorised :func:`cartesian_to_spherical_basis` over (N, 3) directions."""
+    sin_t: float = float(np.sin(theta))
+    cos_t: float = float(np.cos(theta))
+    sin_p: float = float(np.sin(phi))
+    cos_p: float = float(np.cos(phi))
+
+    dx = directions[:, 0]
+    dy = directions[:, 1]
+    dz = directions[:, 2]
+
+    n_r = dx * sin_t * cos_p + dy * cos_t + dz * sin_t * sin_p
+    n_theta = dx * cos_t * cos_p - dy * sin_t + dz * cos_t * sin_p
+    n_phi = -dx * sin_p + dz * cos_p
+    return np.stack([n_r, n_theta, n_phi], axis=1)
+
+
+def _build_initial_momenta(
+    n_components: NDArray[np.float64], r: float, theta: float, rs: float
+) -> NDArray[np.float64]:
+    """Convert local-frame unit directions to coordinate-basis null 4-momenta."""
+    f: float = 1.0 - rs / r
+    sqrt_f: float = float(np.sqrt(f))
+    sin_theta: float = float(np.sin(theta))
+    n: int = n_components.shape[0]
+
+    momenta = np.empty((n, 4), dtype=np.float64)
+    momenta[:, 0] = 1.0 / sqrt_f
+    momenta[:, 1] = n_components[:, 0] * sqrt_f
+    momenta[:, 2] = n_components[:, 1] / r
+    momenta[:, 3] = n_components[:, 2] / (r * sin_theta)
+    return momenta
+
+
+def _render_chunk(args: tuple) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+    """Worker: trace a batch of rays and return (pixel_indices, linear-RGB)."""
+    (
+        indices,
+        positions,
+        momenta,
+        integrator,
+        scene_objects,
+        disk_inner,
+        disk_outer,
+        background,
+    ) = args
+
+    n: int = len(indices)
+    colors: NDArray[np.float64] = np.tile(background, (n, 1))
+    black: NDArray[np.float64] = np.zeros(3, dtype=np.float64)
+
+    for i in range(n):
+        result = integrator.integrate(
+            positions[i],
+            momenta[i],
+            disk_inner=disk_inner,
+            disk_outer=disk_outer,
+        )
+
+        if result.termination == "horizon":
+            colors[i] = black
+        elif result.termination == "disk":
+            r_hit: float = float(result.final_position[1])
+            for obj in scene_objects:
+                if obj.inner_radius <= r_hit <= obj.outer_radius:
+                    theta_hit: float = float(result.final_position[2])
+                    phi_hit: float = float(result.final_position[3])
+                    cart = spherical_to_cartesian(r_hit, theta_hit, phi_hit)
+                    colors[i] = obj.color(cart[np.newaxis, :])[0]
+                    break
+
+    return indices, colors
+
+
 class CurvedRenderer:
     """Geodesic ray tracer in a static, asymptotically-flat spacetime.
 
@@ -108,8 +188,13 @@ class CurvedRenderer:
         Equatorial disks tested when a geodesic crosses the equatorial plane.
     background_color:
         Linear RGB for rays that escape to infinity.
-    progress_every:
-        Print a progress line every N pixels. Set to 0 to disable.
+    n_workers:
+        Worker processes for parallel rendering. ``None`` (default) uses every
+        CPU. ``1`` runs serially in the calling process and skips
+        multiprocessing entirely (handy for debugging).
+    chunks_per_worker:
+        Tasks each worker receives (smaller chunks → smoother progress bar
+        and better load balance, larger chunks → less pickling overhead).
     """
 
     def __init__(
@@ -119,7 +204,8 @@ class CurvedRenderer:
         integrator: GeodesicIntegrator,
         scene_objects: list[EquatorialDisk],
         background_color: NDArray[np.float64] | None = None,
-        progress_every: int = 5000,
+        n_workers: int | None = None,
+        chunks_per_worker: int = 4,
     ) -> None:
         self.camera = camera
         self.metric = metric
@@ -130,7 +216,9 @@ class CurvedRenderer:
             if background_color is not None
             else np.array([0.02, 0.02, 0.08], dtype=np.float64)
         )
-        self.progress_every: int = int(progress_every)
+        cpu = os.cpu_count() or 1
+        self.n_workers: int = int(n_workers) if n_workers is not None else cpu
+        self.chunks_per_worker: int = max(1, int(chunks_per_worker))
 
     def _disk_radii(self) -> tuple[float, float] | tuple[None, None]:
         """Return the union of all disk radii, or (None, None) if no disks."""
@@ -140,94 +228,104 @@ class CurvedRenderer:
         outer: float = max(o.outer_radius for o in self.scene_objects)
         return inner, outer
 
-    def _initial_momentum(
-        self, r: float, theta: float, n_r: float, n_theta: float, n_phi: float
-    ) -> NDArray[np.float64]:
-        """Build a null 4-momentum from a unit direction in the static frame.
-
-        Static observer at radius r with energy E = 1 sees a photon moving in
-        direction (n_r, n_θ, n_φ). The corresponding coordinate-basis components
-        satisfy g_{μν} p^μ p^ν = 0 by construction.
-        """
-        f: float = 1.0 - self.metric.rs / r
-        sqrt_f: float = float(np.sqrt(f))
-        sin_theta: float = float(np.sin(theta))
-
-        p_t: float = 1.0 / sqrt_f
-        p_r: float = n_r * sqrt_f
-        p_theta: float = n_theta / r
-        p_phi: float = n_phi / (r * sin_theta)
-        return np.array([p_t, p_r, p_theta, p_phi], dtype=np.float64)
-
-    def _shade_disk_hit(self, hit_position: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Return the linear-RGB colour at a (4,) Schwarzschild disk-crossing point."""
-        r_hit: float = float(hit_position[1])
-        theta_hit: float = float(hit_position[2])
-        phi_hit: float = float(hit_position[3])
-        cart: NDArray[np.float64] = spherical_to_cartesian(r_hit, theta_hit, phi_hit)
-
-        for obj in self.scene_objects:
-            if obj.inner_radius <= r_hit <= obj.outer_radius:
-                return obj.color(cart[np.newaxis, :])[0]
-        return self.background_color
-
     def render(self) -> NDArray[np.uint8]:
         """Trace every camera ray and return an (H, W, 3) uint8 image."""
         W: int = self.camera.width
         H: int = self.camera.height
         N: int = H * W
 
-        origins, directions = self.camera.generate_rays()
+        _, directions = self.camera.generate_rays()
         cam_pos: NDArray[np.float64] = np.asarray(self.camera.position, dtype=np.float64)
         r_cam, theta_cam, phi_cam = cartesian_to_spherical(cam_pos)
 
+        n_local = _project_basis_batch(directions, theta_cam, phi_cam)
+        momenta = _build_initial_momenta(n_local, r_cam, theta_cam, self.metric.rs)
+        positions = np.empty((N, 4), dtype=np.float64)
+        positions[:, 0] = 0.0
+        positions[:, 1] = r_cam
+        positions[:, 2] = theta_cam
+        positions[:, 3] = phi_cam
+
         disk_inner, disk_outer = self._disk_radii()
-
         image_linear: NDArray[np.float64] = np.tile(self.background_color, (N, 1))
-        black: NDArray[np.float64] = np.zeros(3, dtype=np.float64)
 
+        n_chunks = max(1, self.n_workers * self.chunks_per_worker)
+        index_chunks = np.array_split(np.arange(N, dtype=np.int64), n_chunks)
+        tasks = [
+            (
+                idx,
+                positions[idx],
+                momenta[idx],
+                self.integrator,
+                self.scene_objects,
+                disk_inner,
+                disk_outer,
+                self.background_color,
+            )
+            for idx in index_chunks
+        ]
+
+        print(
+            f"Rendering {N} rays across {len(tasks)} chunks "
+            f"on {self.n_workers} worker(s)..."
+        )
         start_time: float = time.perf_counter()
-        for i in range(N):
-            n_r, n_theta, n_phi = cartesian_to_spherical_basis(
-                directions[i], theta_cam, phi_cam
-            )
-            position: NDArray[np.float64] = np.array(
-                [0.0, r_cam, theta_cam, phi_cam], dtype=np.float64
-            )
-            momentum: NDArray[np.float64] = self._initial_momentum(
-                r_cam, theta_cam, n_r, n_theta, n_phi
-            )
 
-            result = self.integrator.integrate(
-                position,
-                momentum,
-                disk_inner=disk_inner,
-                disk_outer=disk_outer,
-            )
-
-            if result.termination == "horizon":
-                image_linear[i] = black
-            elif result.termination == "disk":
-                image_linear[i] = self._shade_disk_hit(result.final_position)
-            # "escape" and "max_steps" both fall through to background.
-
-            if self.progress_every and (i + 1) % self.progress_every == 0:
-                elapsed: float = time.perf_counter() - start_time
-                rate: float = (i + 1) / elapsed
-                eta: float = (N - (i + 1)) / rate if rate > 0 else float("inf")
-                pct: float = 100.0 * (i + 1) / N
-                print(
-                    f"  {i + 1:>7}/{N} ({pct:5.1f}%)  "
-                    f"{rate:.0f} rays/s  ETA {eta:5.1f}s"
-                )
+        if self.n_workers <= 1:
+            self._render_serial(tasks, image_linear, start_time)
+        else:
+            self._render_parallel(tasks, image_linear, start_time)
 
         total: float = time.perf_counter() - start_time
-        print(f"Render finished in {total:.2f}s ({N / total:.0f} rays/s).")
+        rate: float = N / total if total > 0 else float("inf")
+        print(f"Render finished in {total:.2f}s ({rate:.0f} rays/s).")
 
         image_uint8: NDArray[np.uint8] = (
             np.clip(image_linear, 0.0, 1.0) * 255.0 + 0.5
         ).astype(np.uint8)
         return image_uint8.reshape(H, W, 3)
+
+    def _render_serial(
+        self,
+        tasks: list[tuple],
+        image_linear: NDArray[np.float64],
+        start_time: float,
+    ) -> None:
+        """In-process fallback used when ``n_workers <= 1``."""
+        n_chunks = len(tasks)
+        for i, task in enumerate(tasks, start=1):
+            indices, colors = _render_chunk(task)
+            image_linear[indices] = colors
+            self._print_progress(i, n_chunks, start_time)
+
+    def _render_parallel(
+        self,
+        tasks: list[tuple],
+        image_linear: NDArray[np.float64],
+        start_time: float,
+    ) -> None:
+        """Run chunks across a process pool, splicing results back as they land."""
+        n_chunks = len(tasks)
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=self.n_workers) as pool:
+            completed = 0
+            for indices, colors in pool.imap_unordered(_render_chunk, tasks):
+                image_linear[indices] = colors
+                completed += 1
+                self._print_progress(completed, n_chunks, start_time)
+
+    @staticmethod
+    def _print_progress(done: int, total: int, start_time: float) -> None:
+        """Single-line percentage progress with rate and ETA."""
+        elapsed = time.perf_counter() - start_time
+        pct = 100.0 * done / total
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else float("inf")
+        print(
+            f"  [{done:>3}/{total}] {pct:5.1f}%  "
+            f"elapsed {elapsed:6.1f}s  ETA {eta:6.1f}s",
+            flush=True,
+        )
 
     def save_png(self, image: NDArray[np.uint8], path: str | Path) -> None:
         """Save an (H, W, 3) uint8 image to a PNG file, creating parents."""

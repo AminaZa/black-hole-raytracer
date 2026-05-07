@@ -135,10 +135,16 @@ def _project_basis_batch(
 
 
 def _build_initial_momenta(
-    n_components: NDArray[np.float64], r: float, theta: float, rs: float
+    n_components: NDArray[np.float64], r: float, theta: float, r_grav: float
 ) -> NDArray[np.float64]:
-    """Convert local-frame unit directions to coordinate-basis null 4-momenta."""
-    f: float = 1.0 - rs / r
+    """Convert local-frame unit directions to coordinate-basis null 4-momenta.
+
+    ``r_grav`` is the gravitational-radius scale 2M used in the asymptotic
+    static-observer redshift factor ``f = 1 - 2M/r``. For Schwarzschild this
+    equals the horizon ``rs``; for Kerr it is the right asymptotic value at
+    the camera (frame-dragging corrections fall as a²/r²).
+    """
+    f: float = 1.0 - r_grav / r
     sqrt_f: float = float(np.sqrt(f))
     sin_theta: float = float(np.sin(theta))
     n: int = n_components.shape[0]
@@ -308,7 +314,9 @@ class CurvedRenderer:
         r_cam, theta_cam, phi_cam = cartesian_to_spherical(cam_pos)
 
         n_local = _project_basis_batch(directions, theta_cam, phi_cam)
-        momenta = _build_initial_momenta(n_local, r_cam, theta_cam, self.metric.rs)
+        momenta = _build_initial_momenta(
+            n_local, r_cam, theta_cam, 2.0 * self.metric.mass
+        )
         positions = np.empty((N, 4), dtype=np.float64)
         positions[:, 0] = 0.0
         positions[:, 1] = r_cam

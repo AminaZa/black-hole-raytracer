@@ -37,19 +37,21 @@ def test_outside_annulus_is_zero() -> None:
     assert np.allclose(rgb, 0.0)
 
 
-def test_gravitational_redshift_lowers_temperature() -> None:
-    """Without a Doppler term, T_obs = sqrt(1 - rs/r) * T_emit < T_emit."""
+def test_inner_pixel_is_bluer_than_outer() -> None:
+    """T_obs = √(1 - rs/r) · T_peak (r_isco/r)^(3/4) is hotter at small r,
+    so the blackbody-RGB inner pixel sits bluer (higher blue/red ratio) than
+    the outer one despite the inner pixel being dimmed by Doppler beaming."""
     disk = PhysicalAccretionDisk(
-        inner_radius=6.0, outer_radius=20.0, mass=1.0, t_peak=20000.0
+        inner_radius=6.0, outer_radius=20.0, mass=1.0, t_peak=12000.0
     )
-    near = disk.color(_hit_at(6.0))[0]
-    far = disk.color(_hit_at(20.0))[0]
-    # Both pixels are non-black inside the annulus.
+    near = disk.color(_hit_at(6.5))[0]
+    far = disk.color(_hit_at(18.0))[0]
+
     assert near.sum() > 0.0
     assert far.sum() > 0.0
-    # Inner is hotter than outer despite the larger redshift; T(r) ∝ r^(-3/4)
-    # dominates over the redshift factor across this range.
-    assert near.sum() > far.sum()
+    near_blue_red = near[2] / max(near[0], 1e-9)
+    far_blue_red = far[2] / max(far[0], 1e-9)
+    assert near_blue_red > far_blue_red
 
 
 def test_doppler_brightens_approaching_side() -> None:
@@ -80,10 +82,14 @@ def test_doppler_brightens_approaching_side() -> None:
     assert rgb_approach.sum() > rgb_recede.sum()
 
 
-def test_radial_photon_doppler_factor_is_unity() -> None:
-    """A photon with no φ component sees no Doppler boost."""
+def test_radial_photon_only_picks_up_time_dilation() -> None:
+    """A radial photon (β·n = 0) has Doppler factor 1/γ, not 1: the orbiting
+    fluid still time-dilates an axial photon. The intensity ratio between
+    the with-momentum and gravitational-only paths must therefore equal
+    (1/γ)^beaming_exponent, not 1."""
     disk = PhysicalAccretionDisk(
-        inner_radius=6.0, outer_radius=20.0, mass=1.0, t_peak=12000.0
+        inner_radius=6.0, outer_radius=20.0, mass=1.0, t_peak=12000.0,
+        beaming_exponent=3.0,
     )
     r = 10.0
     point = _hit_at(r)
@@ -93,4 +99,14 @@ def test_radial_photon_doppler_factor_is_unity() -> None:
 
     rgb_with = disk.color(point, photon_momenta=p_radial)[0]
     rgb_without = disk.color(point)[0]
-    np.testing.assert_allclose(rgb_with, rgb_without, rtol=1e-12, atol=1e-12)
+
+    # Radial photon → β·n = 0, but g_dop = 1/γ ≠ 1 (time dilation only).
+    # The exact ratio of total RGB also picks up a small spectral-shift
+    # correction from the blackbody curve at the redshifted temperature, so
+    # the comparison is approximate.
+    v_orbit = np.sqrt(1.0 / r)
+    inv_gamma = float(np.sqrt(1.0 - v_orbit * v_orbit))
+    expected_ratio = inv_gamma**3
+    actual_ratio = rgb_with.sum() / rgb_without.sum()
+    assert actual_ratio < 1.0
+    assert actual_ratio == pytest.approx(expected_ratio, rel=5e-2)

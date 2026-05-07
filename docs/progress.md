@@ -1,5 +1,72 @@
 # Progress Log
 
+### 2026-05-07 — Phase 4: Kerr metric (rotating black hole)
+
+Phase 4 is in. The integrator was not touched — the Kerr metric drops in
+through the same `MetricProtocol` (`rs`, `christoffel_symbols`,
+`acceleration`) that Schwarzschild uses. Spin a = 0.99 M renders and a
+4-panel a ∈ {0, 0.5, 0.9, 0.99} comparison are wired up.
+
+New / changed:
+- `src/metrics/kerr.py` — `KerrMetric(mass, spin)` in Boyer-Lindquist
+  coordinates. Closed-form `metric_tensor`, `inverse_metric` (uses the exact
+  identity `det(g_{tφ block}) = -Δ sin²θ`), `metric_derivatives` and
+  `christoffel_symbols`. The integrator's hot path is `acceleration`, which
+  is fully inlined: one `_aux` call per step, the dg matrix entries are kept
+  as scalars, and the final 4-vector contraction is hand-unrolled. `rs` is
+  set to the outer horizon `r_+ = M + √(M² − a²)` so the integrator's
+  termination radius and step bands track the actual horizon, not 2M.
+- `src/scene/kerr_accretion_disk.py` — `KerrAccretionDisk` with the
+  Bardeen-Press-Teukolsky ISCO via Z₁, Z₂; defaults `inner_radius` to the
+  prograde ISCO (≈ 1.45 M at a = 0.99). Uses prograde Kepler
+  Ω = √M / (r^{3/2} + a √M). Per-photon redshift is computed from the
+  conserved scalars: lower indices using the equatorial Kerr metric, then
+  `g = E / [u^t (E − Ω L)]` applied to both temperature and beaming.
+- `src/render/curved_renderer.py` — `_build_initial_momenta` now takes
+  the gravitational radius scale `r_grav = 2M`, not the integrator's `rs`.
+  For Schwarzschild the two coincide (rs = 2M); for Kerr the asymptotic
+  static-observer redshift wants 2M, not the smaller r_+. Verified: all
+  Schwarzschild tests pass unchanged.
+- `examples/kerr_render.py` — a = 0.99 render at 800×600, 75° inclination,
+  saved to `gallery/kerr_render.png`.
+- `examples/spin_comparison.py` — 4-panel a ∈ {0, 0.5, 0.9, 0.99} tile at
+  400×300 each with labels, saved to `gallery/spin_comparison.png`.
+- Tests: `tests/metrics/test_kerr.py` (11 cases) covers parameter
+  validation, horizon shrinkage with spin, exact reduction to Schwarzschild
+  at a = 0 (metric and Christoffels), inverse-metric consistency, lower-
+  index symmetry of Γ, agreement of inlined `acceleration` with the
+  full-Christoffel route, integrator drop-in, and L_z conservation.
+  `tests/scene/test_kerr_accretion_disk.py` (9 cases) covers the ISCO
+  formula (6M at a=0, → M as a → M, retrograde > prograde), annulus
+  clipping, the static-redshift-only path, and the Doppler asymmetry that
+  spin produces. Two pre-existing physical-disk tests had wrong physics
+  premises (claimed inner pixel brighter than outer, and g_dop = 1 for a
+  radial photon) — both rewritten in terms of the correct physics
+  (spectral character / time-dilation 1/γ).
+
+Performance — the Kerr per-ray cost is the bottleneck:
+- First Kerr cut (christoffel_symbols → einsum acceleration): ~42 rays/s
+  single-thread on the 80×60 smoke test (matches the old Schwarzschild
+  baseline before its Phase-2.5 rework).
+- After hand-inlining `acceleration` (no full Γ tensor, scalar dg entries,
+  unrolled final contraction): **~231 rays/s single-thread, 5.5× speedup.**
+- Kerr is now ~4.6× slower per-ray than Schwarzschild's closed-form path
+  (1067 rays/s). Acceptable given the substantially heavier metric. The
+  main remaining win is per-ray vectorisation across the integrator — Phase
+  5 work.
+
+The integrator change-set is empty: zero edits in `src/geodesic/integrator.py`.
+
+Known limitation in this phase: rays whose backward-traced trajectory grazes
+the spin axis (θ → 0 or θ → π) hit the Boyer-Lindquist coordinate
+singularity — `g^{φφ} ∝ 1/sin²θ` blows up there, the RK4 stride punches
+across the axis, and those pixels emerge as a thin dark streak through the
+projection of the +y spin axis on the image. The fix is a generic axis-
+reflection step in the integrator (`θ → -θ`, `φ → φ + π` when θ wraps past
+zero), which would equally benefit Schwarzschild renders that happen to aim
+at the pole. Deferred until Phase 5 along with the per-ray vectorisation
+work, since both are integrator-level changes.
+
 ### 2026-05-06 — Phase 2.5: parallel + closed-form-Christoffel optimisation
 
 Cut single-thread renderer overhead and fanned the work out across CPU cores.

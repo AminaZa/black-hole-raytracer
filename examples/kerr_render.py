@@ -24,11 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 
 from camera.camera import Camera
-from geodesic.integrator import GeodesicIntegrator
 from metrics.kerr import KerrMetric
-from render.curved_renderer import CurvedRenderer
 from scene.kerr_accretion_disk import KerrAccretionDisk
 from scene.starfield import Starfield
+from utils.cuda_loader import device_summary, gpu_available
 
 
 def main() -> None:
@@ -63,22 +62,45 @@ def main() -> None:
 
     starfield = Starfield(n_stars=2500, seed=42, star_radius_deg=0.3)
 
-    integrator = GeodesicIntegrator(
-        metric=metric,
-        r_max=120.0,
-        horizon_eps=1e-3,
-        base_step=0.25,
-        near_field_factor=0.1,
-        far_field_factor=2.0,
-    )
+    print(f"Compute backend: {device_summary()}")
+    if gpu_available:
+        from geodesic.gpu_integrator import GpuGeodesicIntegrator
+        from render.gpu_renderer import GpuRenderer
 
-    renderer = CurvedRenderer(
-        camera=camera,
-        metric=metric,
-        integrator=integrator,
-        scene_objects=[disk],
-        background_sampler=starfield,
-    )
+        integrator = GpuGeodesicIntegrator(
+            metric=metric,
+            r_max=120.0,
+            horizon_eps=1e-3,
+            base_step=0.25,
+            near_field_factor=0.1,
+            far_field_factor=2.0,
+        )
+        renderer = GpuRenderer(
+            camera=camera,
+            metric=metric,
+            integrator=integrator,
+            scene_objects=[disk],
+            background_sampler=starfield,
+        )
+    else:
+        from geodesic.integrator import GeodesicIntegrator
+        from render.curved_renderer import CurvedRenderer
+
+        integrator = GeodesicIntegrator(
+            metric=metric,
+            r_max=120.0,
+            horizon_eps=1e-3,
+            base_step=0.25,
+            near_field_factor=0.1,
+            far_field_factor=2.0,
+        )
+        renderer = CurvedRenderer(
+            camera=camera,
+            metric=metric,
+            integrator=integrator,
+            scene_objects=[disk],
+            background_sampler=starfield,
+        )
 
     print(
         f"Rendering Kerr (M={metric.mass}, a={metric.spin}, r+={metric.r_plus:.4f}, "

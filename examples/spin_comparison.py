@@ -23,11 +23,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from camera.camera import Camera
-from geodesic.integrator import GeodesicIntegrator
 from metrics.kerr import KerrMetric
-from render.curved_renderer import CurvedRenderer
 from scene.kerr_accretion_disk import KerrAccretionDisk
 from scene.starfield import Starfield
+from utils.cuda_loader import device_summary, gpu_available
 
 
 SPINS: tuple[float, ...] = (0.0, 0.5, 0.9, 0.99)
@@ -64,22 +63,44 @@ def render_panel(spin: float, starfield: Starfield) -> np.ndarray:
         prograde=True,
     )
 
-    integrator = GeodesicIntegrator(
-        metric=metric,
-        r_max=120.0,
-        horizon_eps=1e-3,
-        base_step=0.25,
-        near_field_factor=0.1,
-        far_field_factor=2.0,
-    )
+    if gpu_available:
+        from geodesic.gpu_integrator import GpuGeodesicIntegrator
+        from render.gpu_renderer import GpuRenderer
 
-    renderer = CurvedRenderer(
-        camera=camera,
-        metric=metric,
-        integrator=integrator,
-        scene_objects=[disk],
-        background_sampler=starfield,
-    )
+        integrator = GpuGeodesicIntegrator(
+            metric=metric,
+            r_max=120.0,
+            horizon_eps=1e-3,
+            base_step=0.25,
+            near_field_factor=0.1,
+            far_field_factor=2.0,
+        )
+        renderer = GpuRenderer(
+            camera=camera,
+            metric=metric,
+            integrator=integrator,
+            scene_objects=[disk],
+            background_sampler=starfield,
+        )
+    else:
+        from geodesic.integrator import GeodesicIntegrator
+        from render.curved_renderer import CurvedRenderer
+
+        integrator = GeodesicIntegrator(
+            metric=metric,
+            r_max=120.0,
+            horizon_eps=1e-3,
+            base_step=0.25,
+            near_field_factor=0.1,
+            far_field_factor=2.0,
+        )
+        renderer = CurvedRenderer(
+            camera=camera,
+            metric=metric,
+            integrator=integrator,
+            scene_objects=[disk],
+            background_sampler=starfield,
+        )
 
     print(
         f"\n--- a = {spin}  (r+ = {metric.r_plus:.4f}, ISCO = {disk.isco:.4f}) ---"
@@ -99,6 +120,7 @@ def _load_font(size: int) -> ImageFont.ImageFont:
 
 def main() -> None:
     starfield = Starfield(n_stars=2500, seed=42, star_radius_deg=0.3)
+    print(f"Compute backend: {device_summary()}")
 
     panels: list[np.ndarray] = []
     wall_start = time.perf_counter()

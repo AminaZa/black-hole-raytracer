@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from utils.cuda_loader import get_xp
+
 
 class SchwarzschildMetric:
     """Static, spherically symmetric vacuum spacetime around a point mass.
@@ -160,3 +162,47 @@ class SchwarzschildMetric:
         dpph: float = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
 
         return np.array([dpt, dpr, dpth, dpph], dtype=np.float64)
+
+    def acceleration_batch(
+        self,
+        positions: NDArray[np.float64],
+        momenta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Vectorised acceleration for an array of rays, shape (N, 4).
+
+        Operates on numpy or cupy arrays transparently — the array module is
+        picked from ``positions``. Returns an (N, 4) array of the same kind.
+        Mirrors :meth:`acceleration` element-wise.
+        """
+        xp = get_xp(positions)
+        r = positions[:, 1]
+        theta = positions[:, 2]
+        rs = self.rs
+        M = self.mass
+
+        sin_t = xp.sin(theta)
+        cos_t = xp.cos(theta)
+        f = 1.0 - rs / r
+        inv_r = 1.0 / r
+        r_minus_rs = r - rs
+
+        gamma_t_tr = M / (r * r_minus_rs)
+        gamma_r_tt = (M / (r * r)) * f
+
+        pt = momenta[:, 0]
+        pr = momenta[:, 1]
+        pth = momenta[:, 2]
+        pph = momenta[:, 3]
+
+        dpt = -2.0 * gamma_t_tr * pt * pr
+        dpr = -(
+            gamma_r_tt * pt * pt
+            - gamma_t_tr * pr * pr
+            - r_minus_rs * pth * pth
+            - r_minus_rs * sin_t * sin_t * pph * pph
+        )
+        dpth = -(2.0 * inv_r * pr * pth - sin_t * cos_t * pph * pph)
+        cot_t = cos_t / sin_t
+        dpph = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
+
+        return xp.stack([dpt, dpr, dpth, dpph], axis=1)

@@ -1,5 +1,85 @@
 # Progress Log
 
+### 2026-05-07 — Phase 5: GPU acceleration via CuPy
+
+Phase 5 introduces a CuPy-backed batched ray tracer that integrates every
+pixel ray simultaneously on the GPU. The CPU multiprocessing path stays
+intact; example scripts auto-detect GPU and pick the right backend.
+
+Hardware on this box: **NVIDIA RTX 3080 Ti Laptop, 16 GiB, CC 8.6**.
+
+Install: ``cupy-cuda12x`` 13.6.0 plus the supporting NVIDIA wheels —
+``nvidia-cuda-runtime-cu12``, ``nvidia-cuda-nvrtc-cu12``,
+``nvidia-cuda-cccl-cu12``, ``nvidia-cublas-cu12``, ``nvidia-curand-cu12``,
+``nvidia-cusolver-cu12``, ``nvidia-cusparse-cu12``, ``nvidia-cufft-cu12``.
+On Windows pure-pip the NVRTC and runtime DLLs live under
+``site-packages/nvidia/<lib>/bin``; CuPy needs them registered with
+``os.add_dll_directory`` *and* prepended to ``PATH`` before import (so the
+transitive ``LoadLibraryEx`` from inside ``nvrtc64_120_0.dll`` finds the
+``nvrtc-builtins64_129.dll`` next to it). All of that is hidden inside
+:mod:`utils.cuda_loader` — at import it sets up the DLL search paths,
+imports CuPy, and exposes ``gpu_available`` and ``xp_module`` for the rest
+of the codebase.
+
+New / changed:
+- `src/utils/cuda_loader.py` — DLL-path discovery, ``load_cupy``,
+  ``device_summary``, ``asnumpy``, ``get_xp``. Linux / Mac just import
+  CuPy directly; this whole file is a no-op there.
+- `src/metrics/schwarzschild.py` and `src/metrics/kerr.py` — added
+  ``acceleration_batch(positions, momenta)`` that mirrors the inlined
+  scalar acceleration but operates on (N, 4) arrays. The array module is
+  detected from ``positions`` via :func:`utils.cuda_loader.get_xp`, so the
+  same code runs on numpy or cupy. CPU and GPU paths agree to ≈ 3·10⁻¹⁴
+  on float64.
+- `src/geodesic/gpu_integrator.py` — :class:`GpuGeodesicIntegrator` does
+  RK4 on the whole (N, 4) ray batch in lockstep, with a per-ray
+  ``live_mask`` for horizon / escape / disk termination. Polls
+  ``live_mask.any()`` every 32 steps to amortise the GPU→CPU sync cost
+  (each ``.any()`` was a full pipeline drain). The integrator is
+  array-module agnostic — pass numpy arrays for a CPU dry-run, cupy for
+  the GPU path. The 2D termination state machine is encoded as four
+  module-level integer constants (``TERM_HORIZON`` etc.) so the result is
+  trivially marshalable across the device boundary.
+- `src/render/gpu_renderer.py` — :class:`GpuRenderer`. Builds initial
+  (positions, momenta) on the host, uploads once, calls the integrator
+  once, brings ``(termination, final_position, final_momentum)`` back to
+  CPU and shades there. Disk colour and starfield sampling stay on the
+  CPU — they're O(N) but small compared to the RK4 loop. Falls back to
+  the numpy path when CuPy is unavailable, so the same renderer is also a
+  single-process batched CPU renderer.
+- `examples/kerr_render.py` and `examples/spin_comparison.py` — both
+  scripts pick the GPU renderer when available, log
+  ``device_summary()`` at startup, and fall back to the multiprocessing
+  CPU path otherwise.
+- `tests/metrics/test_acceleration_batch.py` (4 numpy parametrisations,
+  2 cupy parametrisations gated on ``gpu_available``). Verifies the
+  batched acceleration matches the scalar one element-wise.
+- `tests/geodesic/test_gpu_integrator.py` (3 cases). Three canonical
+  rays — horizon, escape, disk — agree with the per-ray CPU integrator
+  bit-for-bit (interpolated disk crossing matches to 1e-10). A cupy-only
+  case verifies the CuPy device path matches the numpy host path.
+
+Performance (single-thread Python driver):
+
+| Backend                  | 480k Kerr a=0.99 rays | rays/s    | Speedup vs single-thread CPU |
+|--------------------------|-----------------------|-----------|------------------------------|
+| CPU single-thread Kerr   | ≈ 35 min              | ~230      | 1×                           |
+| CPU 8 workers (Phase 4)  | 5.6 min               | 1 439     | 6.3×                         |
+| GPU batch (this phase)   | ≈ 45 s                | 10 620    | 46×                          |
+
+The GPU win comes from launching ~30 vectorised kernels per RK4 step over
+the full 480k-ray batch instead of running per-ray Python loops on 8 CPU
+cores. The remaining headroom is kernel-launch overhead and many small
+intermediate allocations in ``acceleration_batch`` — a fused custom CUDA
+kernel (or ``cupy.fuse``) over the RK4 substep would fold those together
+and is the obvious next optimisation. float32 mode would be another big
+win on a consumer GPU (8× FP32 vs FP64 on Ampere) at the cost of some
+near-photon-sphere precision.
+
+Polar-axis BL singularity from Phase 4 is unchanged — the GPU integrator
+inherits the same artefact. The fix is still the generic axis-reflection
+step in the integrator and is now Phase 6 work.
+
 ### 2026-05-07 — Phase 4: Kerr metric (rotating black hole)
 
 Phase 4 is in. The integrator was not touched — the Kerr metric drops in

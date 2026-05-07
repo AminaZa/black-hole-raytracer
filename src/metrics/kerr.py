@@ -21,6 +21,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from utils.cuda_loader import get_xp
+
 
 class KerrMetric:
     """Stationary axisymmetric Kerr black hole in Boyer-Lindquist coordinates.
@@ -265,3 +267,106 @@ class KerrMetric:
         acc3: float = ginv_tp * h0 + ginv_pp * h3
 
         return np.array([acc0, acc1, acc2, acc3], dtype=np.float64)
+
+    def acceleration_batch(
+        self,
+        positions: NDArray[np.float64],
+        momenta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Vectorised acceleration for an array of rays, shape (N, 4).
+
+        Same closed-form contraction as :meth:`acceleration` but operating
+        element-wise across rays. Works on numpy or cupy arrays — the array
+        module is picked from ``positions``.
+        """
+        xp = get_xp(positions)
+        a: float = self.spin
+        M: float = self.mass
+        a2: float = a * a
+
+        r = positions[:, 1]
+        theta = positions[:, 2]
+
+        sin_t = xp.sin(theta)
+        cos_t = xp.cos(theta)
+        sin2 = sin_t * sin_t
+        cos2 = cos_t * cos_t
+        sin_cos = sin_t * cos_t
+        Sigma = r * r + a2 * cos2
+        Delta = r * r - 2.0 * M * r + a2
+        Sigma_sq = Sigma * Sigma
+        dS_dr = 2.0 * r
+        dS_dt = -2.0 * a2 * sin_cos
+        dD_dr = 2.0 * (r - M)
+
+        # Covariant metric components.
+        g_tt = -(1.0 - 2.0 * M * r / Sigma)
+        g_tphi = -2.0 * M * a * r * sin2 / Sigma
+        g_pp = (r * r + a2 + 2.0 * M * a2 * r * sin2 / Sigma) * sin2
+
+        # ∂_r g and ∂_θ g (only the symmetric upper-triangle entries needed).
+        dg_dr_tt = 2.0 * M * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_tp = -2.0 * M * a * sin2 * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_rr = (dS_dr * Delta - Sigma * dD_dr) / (Delta * Delta)
+        dg_dr_th = dS_dr
+        dA2_dr = 2.0 * M * a2 * sin2 * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_pp = (2.0 * r + dA2_dr) * sin2
+
+        dg_dt_tt = -2.0 * M * r * dS_dt / Sigma_sq
+        dg_dt_tp = (
+            -2.0 * M * a * r * (2.0 * sin_cos * Sigma - sin2 * dS_dt) / Sigma_sq
+        )
+        dg_dt_rr = dS_dt / Delta
+        dg_dt_th = dS_dt
+        dA2_dt = (
+            2.0 * M * a2 * r * (2.0 * sin_cos * Sigma - sin2 * dS_dt) / Sigma_sq
+        )
+        bracket = r * r + a2 + 2.0 * M * a2 * r * sin2 / Sigma
+        dg_dt_pp = dA2_dt * sin2 + bracket * 2.0 * sin_cos
+
+        # Inverse metric. det of (t, φ) block is -Δ sin²θ exactly.
+        det_tp = -Delta * sin2
+        ginv_tt = g_pp / det_tp
+        ginv_tp = -g_tphi / det_tp
+        ginv_pp = g_tt / det_tp
+        ginv_rr = Delta / Sigma
+        ginv_th = 1.0 / Sigma
+
+        pt = momenta[:, 0]
+        pr = momenta[:, 1]
+        pth = momenta[:, 2]
+        pph = momenta[:, 3]
+
+        # a_vec[n] = (∂_r g)_{nb} p^b ; b_vec[n] = (∂_θ g)_{nb} p^b.
+        a0 = dg_dr_tt * pt + dg_dr_tp * pph
+        a1 = dg_dr_rr * pr
+        a2_ = dg_dr_th * pth
+        a3 = dg_dr_tp * pt + dg_dr_pp * pph
+
+        b0 = dg_dt_tt * pt + dg_dt_tp * pph
+        b1 = dg_dt_rr * pr
+        b2 = dg_dt_th * pth
+        b3 = dg_dt_tp * pt + dg_dt_pp * pph
+
+        # q[ν] = (∂_ν g_{αβ}) p^α p^β, nonzero only for ν = r, θ.
+        q1 = pt * a0 + pr * a1 + pth * a2_ + pph * a3
+        q2 = pt * b0 + pr * b1 + pth * b2 + pph * b3
+
+        # r[ν] = (∂_α g_{νβ}) p^α p^β = p^r a_vec[ν] + p^θ b_vec[ν].
+        r0 = pr * a0 + pth * b0
+        r1 = pr * a1 + pth * b1
+        r2 = pr * a2_ + pth * b2
+        r3 = pr * a3 + pth * b3
+
+        # acc = g^{μν} (0.5 q[ν] - r[ν]).
+        h0 = -r0
+        h1 = 0.5 * q1 - r1
+        h2 = 0.5 * q2 - r2
+        h3 = -r3
+
+        acc0 = ginv_tt * h0 + ginv_tp * h3
+        acc1 = ginv_rr * h1
+        acc2 = ginv_th * h2
+        acc3 = ginv_tp * h0 + ginv_pp * h3
+
+        return xp.stack([acc0, acc1, acc2, acc3], axis=1)

@@ -1,5 +1,73 @@
 # Progress Log
 
+### 2026-05-07 — Phase 6 + 7: animator and fused acceleration
+
+Two interleaved pieces — the animator made the cost of a render frame
+suddenly matter (we'd be paying it tens or hundreds of times), and the
+fusion pass attacked the dominant cost.
+
+**Phase 6 — frame loop and animation scripts:**
+- `src/render/animator.py` — `Animator` runs a `render_frame(idx, total)`
+  callback per frame, saves each frame as a numbered PNG into a staging
+  directory, and stitches the result into a GIF via `imageio`. Two
+  knobs that turned out to matter: `resume=True` (the default) skips
+  frames whose PNG is already on disk, and `max_frames_per_run` caps
+  fresh renders per call. Together they make a long animation
+  resumable across sessions — important because the Claude Code
+  background-task budget is 10 minutes, and a 120-frame 800×600
+  animation is 30+ minutes even after the fusion pass.
+- `examples/orbit_animation.py` — Kerr a = 0.9, camera at r = 30 M, 75°
+  inclination, 120 frames sweeping azimuth 0 → 2π. Output:
+  `gallery/orbit_animation.gif` (800 × 600 @ 24 fps).
+- `examples/spin_animation.py` — fixed camera, 90 frames with the spin
+  parameter sweeping linearly from 0 to 0.99. The metric, ISCO and
+  disk inner edge are rebuilt per frame; each frame gets an `a = …`
+  label burned into the top-left so the physics story narrates itself.
+  Output: `gallery/spin_evolution.gif` (800 × 600 @ 24 fps).
+- Both example scripts honour `ANIM_MAX_FRAMES_PER_RUN` (env var) so
+  chunked runs are scriptable.
+
+**Phase 7 — fused acceleration kernels:**
+
+The first GPU integrator was launch-overhead bound: per RK4 substep the
+metric's `acceleration_batch` issued ~30 small CuPy kernels (one per
+arithmetic op), and an 800×600 frame integrated at 11 820 rays/s for a
+40 s wall-clock — most of which was kernel-dispatch and small-array
+allocations rather than FP64 compute.
+
+Fix: a module-level `@cupy.fuse` function in each metric that
+contracts the inner element-wise math into a single CUDA kernel.
+- `src/metrics/schwarzschild.py` — `_schwarzschild_accel_fused` (one
+  kernel for the whole inlined Schwarzschild acceleration).
+  ``acceleration_batch`` dispatches to the fused path when given a cupy
+  array and falls back to plain NumPy otherwise.
+- `src/metrics/kerr.py` — `_kerr_accel_fused`. Same dispatch story.
+  Substantially heavier kernel (full BL metric, derivatives, inverse,
+  acceleration contraction inlined) but still one launch.
+- Defined inside `if _cupy is not None:` so the module imports cleanly
+  on machines without CuPy. The numpy path is untouched.
+
+Numerics: fused vs NumPy agrees to **~3 × 10⁻¹⁴** float64 round-off,
+identical to the pre-fusion result. All 56 tests still pass.
+
+Performance — single 800 × 600 Kerr frame at a = 0.99:
+
+| stage                      | rays/s | per-frame (s) |
+|----------------------------|--------|---------------|
+| CPU 20-worker (Phase 4)    | 1 439  | 333.6         |
+| GPU unfused (Phase 5)      | 11 820 |  41.6         |
+| GPU fused (this phase)     | 33 800 |  15.1         |
+
+**~2.86× over the unfused GPU path; 22× over the multiprocess CPU.**
+
+The fused-acceleration micro-benchmark dropped per-call cost from a few
+ms (unfused) to **0.46 ms** (Kerr) / **0.58 ms** (Schwarzschild) at
+N = 50 000. The remaining ~17 ms per RK4 step is the integrator's own
+small-kernel chain (where, mask, RK4 update). That's the next
+optimisation lever — fusing the RK4 update body itself — but is
+deferred; the current speedup already brings full-resolution
+animations into a workable range (orbit ≈ 30 min, spin ≈ 22 min).
+
 ### 2026-05-07 — Phase 5: GPU acceleration via CuPy
 
 Phase 5 introduces a CuPy-backed batched ray tracer that integrates every

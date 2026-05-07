@@ -21,7 +21,95 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from utils.cuda_loader import get_xp
+from utils.cuda_loader import cupy as _cupy, get_xp
+
+
+if _cupy is not None:
+
+    @_cupy.fuse(kernel_name="kerr_accel_fused")
+    def _kerr_accel_fused(  # type: ignore[no-untyped-def]
+        r, theta, pt, pr, pth, pph, M, a
+    ):
+        """Element-wise Kerr acceleration, JIT-fused into one CUDA kernel.
+
+        Mirrors :meth:`KerrMetric.acceleration` but operates on (N,) inputs.
+        Returns the four acceleration components as a tuple of (N,) arrays.
+        """
+        a2 = a * a
+        sin_t = _cupy.sin(theta)
+        cos_t = _cupy.cos(theta)
+        sin2 = sin_t * sin_t
+        cos2 = cos_t * cos_t
+        sin_cos = sin_t * cos_t
+
+        Sigma = r * r + a2 * cos2
+        Delta = r * r - 2.0 * M * r + a2
+        Sigma_sq = Sigma * Sigma
+        dS_dr = 2.0 * r
+        dS_dt = -2.0 * a2 * sin_cos
+        dD_dr = 2.0 * (r - M)
+
+        g_tt = -(1.0 - 2.0 * M * r / Sigma)
+        g_tphi = -2.0 * M * a * r * sin2 / Sigma
+        g_pp = (r * r + a2 + 2.0 * M * a2 * r * sin2 / Sigma) * sin2
+
+        dg_dr_tt = 2.0 * M * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_tp = -2.0 * M * a * sin2 * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_rr = (dS_dr * Delta - Sigma * dD_dr) / (Delta * Delta)
+        dg_dr_th = dS_dr
+        dA2_dr = 2.0 * M * a2 * sin2 * (Sigma - r * dS_dr) / Sigma_sq
+        dg_dr_pp = (2.0 * r + dA2_dr) * sin2
+
+        dg_dt_tt = -2.0 * M * r * dS_dt / Sigma_sq
+        dg_dt_tp = (
+            -2.0 * M * a * r * (2.0 * sin_cos * Sigma - sin2 * dS_dt) / Sigma_sq
+        )
+        dg_dt_rr = dS_dt / Delta
+        dg_dt_th = dS_dt
+        dA2_dt = (
+            2.0 * M * a2 * r * (2.0 * sin_cos * Sigma - sin2 * dS_dt) / Sigma_sq
+        )
+        bracket = r * r + a2 + 2.0 * M * a2 * r * sin2 / Sigma
+        dg_dt_pp = dA2_dt * sin2 + bracket * 2.0 * sin_cos
+
+        det_tp = -Delta * sin2
+        ginv_tt = g_pp / det_tp
+        ginv_tp = -g_tphi / det_tp
+        ginv_pp = g_tt / det_tp
+        ginv_rr = Delta / Sigma
+        ginv_th = 1.0 / Sigma
+
+        a0 = dg_dr_tt * pt + dg_dr_tp * pph
+        a1 = dg_dr_rr * pr
+        a2_ = dg_dr_th * pth
+        a3 = dg_dr_tp * pt + dg_dr_pp * pph
+
+        b0 = dg_dt_tt * pt + dg_dt_tp * pph
+        b1 = dg_dt_rr * pr
+        b2 = dg_dt_th * pth
+        b3 = dg_dt_tp * pt + dg_dt_pp * pph
+
+        q1 = pt * a0 + pr * a1 + pth * a2_ + pph * a3
+        q2 = pt * b0 + pr * b1 + pth * b2 + pph * b3
+
+        r0 = pr * a0 + pth * b0
+        r1 = pr * a1 + pth * b1
+        r2 = pr * a2_ + pth * b2
+        r3 = pr * a3 + pth * b3
+
+        h0 = -r0
+        h1 = 0.5 * q1 - r1
+        h2 = 0.5 * q2 - r2
+        h3 = -r3
+
+        acc0 = ginv_tt * h0 + ginv_tp * h3
+        acc1 = ginv_rr * h1
+        acc2 = ginv_th * h2
+        acc3 = ginv_tp * h0 + ginv_pp * h3
+        return acc0, acc1, acc2, acc3
+
+else:
+    _kerr_accel_fused = None  # type: ignore[assignment]
 
 
 class KerrMetric:
@@ -275,17 +363,28 @@ class KerrMetric:
     ) -> NDArray[np.float64]:
         """Vectorised acceleration for an array of rays, shape (N, 4).
 
-        Same closed-form contraction as :meth:`acceleration` but operating
-        element-wise across rays. Works on numpy or cupy arrays — the array
-        module is picked from ``positions``.
+        On cupy inputs the inner math goes through a single fused CUDA
+        kernel (one launch instead of ~80 small ones). On numpy the same
+        arithmetic runs in NumPy directly. Output array module always
+        matches the input.
         """
         xp = get_xp(positions)
+        r = positions[:, 1]
+        theta = positions[:, 2]
+        pt = momenta[:, 0]
+        pr = momenta[:, 1]
+        pth = momenta[:, 2]
+        pph = momenta[:, 3]
+
+        if _cupy is not None and xp is _cupy:
+            acc0, acc1, acc2, acc3 = _kerr_accel_fused(
+                r, theta, pt, pr, pth, pph, self.mass, self.spin
+            )
+            return xp.stack([acc0, acc1, acc2, acc3], axis=1)
+
         a: float = self.spin
         M: float = self.mass
         a2: float = a * a
-
-        r = positions[:, 1]
-        theta = positions[:, 2]
 
         sin_t = xp.sin(theta)
         cos_t = xp.cos(theta)
@@ -331,11 +430,6 @@ class KerrMetric:
         ginv_pp = g_tt / det_tp
         ginv_rr = Delta / Sigma
         ginv_th = 1.0 / Sigma
-
-        pt = momenta[:, 0]
-        pr = momenta[:, 1]
-        pth = momenta[:, 2]
-        pph = momenta[:, 3]
 
         # a_vec[n] = (∂_r g)_{nb} p^b ; b_vec[n] = (∂_θ g)_{nb} p^b.
         a0 = dg_dr_tt * pt + dg_dr_tp * pph

@@ -10,7 +10,39 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from utils.cuda_loader import get_xp
+from utils.cuda_loader import cupy as _cupy, get_xp
+
+
+if _cupy is not None:
+
+    @_cupy.fuse(kernel_name="schwarzschild_accel_fused")
+    def _schwarzschild_accel_fused(  # type: ignore[no-untyped-def]
+        r, theta, pt, pr, pth, pph, rs, M
+    ):
+        """Element-wise Schwarzschild acceleration, JIT-fused into one CUDA kernel."""
+        sin_t = _cupy.sin(theta)
+        cos_t = _cupy.cos(theta)
+        f = 1.0 - rs / r
+        inv_r = 1.0 / r
+        r_minus_rs = r - rs
+
+        gamma_t_tr = M / (r * r_minus_rs)
+        gamma_r_tt = (M / (r * r)) * f
+
+        dpt = -2.0 * gamma_t_tr * pt * pr
+        dpr = -(
+            gamma_r_tt * pt * pt
+            - gamma_t_tr * pr * pr
+            - r_minus_rs * pth * pth
+            - r_minus_rs * sin_t * sin_t * pph * pph
+        )
+        dpth = -(2.0 * inv_r * pr * pth - sin_t * cos_t * pph * pph)
+        cot_t = cos_t / sin_t
+        dpph = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
+        return dpt, dpr, dpth, dpph
+
+else:
+    _schwarzschild_accel_fused = None  # type: ignore[assignment]
 
 
 class SchwarzschildMetric:
@@ -170,39 +202,41 @@ class SchwarzschildMetric:
     ) -> NDArray[np.float64]:
         """Vectorised acceleration for an array of rays, shape (N, 4).
 
-        Operates on numpy or cupy arrays transparently — the array module is
-        picked from ``positions``. Returns an (N, 4) array of the same kind.
-        Mirrors :meth:`acceleration` element-wise.
+        On cupy inputs the inner math is dispatched to a JIT-fused kernel
+        (one CUDA launch instead of ~15). On numpy the same arithmetic
+        runs directly. Output array module always matches the input.
         """
         xp = get_xp(positions)
         r = positions[:, 1]
         theta = positions[:, 2]
-        rs = self.rs
-        M = self.mass
-
-        sin_t = xp.sin(theta)
-        cos_t = xp.cos(theta)
-        f = 1.0 - rs / r
-        inv_r = 1.0 / r
-        r_minus_rs = r - rs
-
-        gamma_t_tr = M / (r * r_minus_rs)
-        gamma_r_tt = (M / (r * r)) * f
-
         pt = momenta[:, 0]
         pr = momenta[:, 1]
         pth = momenta[:, 2]
         pph = momenta[:, 3]
 
-        dpt = -2.0 * gamma_t_tr * pt * pr
-        dpr = -(
-            gamma_r_tt * pt * pt
-            - gamma_t_tr * pr * pr
-            - r_minus_rs * pth * pth
-            - r_minus_rs * sin_t * sin_t * pph * pph
-        )
-        dpth = -(2.0 * inv_r * pr * pth - sin_t * cos_t * pph * pph)
-        cot_t = cos_t / sin_t
-        dpph = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
+        if _cupy is not None and xp is _cupy:
+            dpt, dpr, dpth, dpph = _schwarzschild_accel_fused(
+                r, theta, pt, pr, pth, pph, self.rs, self.mass
+            )
+        else:
+            rs = self.rs
+            M = self.mass
+            sin_t = xp.sin(theta)
+            cos_t = xp.cos(theta)
+            f = 1.0 - rs / r
+            inv_r = 1.0 / r
+            r_minus_rs = r - rs
+            gamma_t_tr = M / (r * r_minus_rs)
+            gamma_r_tt = (M / (r * r)) * f
+            dpt = -2.0 * gamma_t_tr * pt * pr
+            dpr = -(
+                gamma_r_tt * pt * pt
+                - gamma_t_tr * pr * pr
+                - r_minus_rs * pth * pth
+                - r_minus_rs * sin_t * sin_t * pph * pph
+            )
+            dpth = -(2.0 * inv_r * pr * pth - sin_t * cos_t * pph * pph)
+            cot_t = cos_t / sin_t
+            dpph = -2.0 * (inv_r * pr * pph + cot_t * pth * pph)
 
         return xp.stack([dpt, dpr, dpth, dpph], axis=1)

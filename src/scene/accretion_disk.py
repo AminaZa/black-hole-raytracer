@@ -76,7 +76,11 @@ class AccretionDisk:
 
         return t, hit_points, mask
 
-    def color(self, hit_points: NDArray[np.float64]) -> NDArray[np.float64]:
+    def color(
+        self,
+        hit_points: NDArray[np.float64],
+        photon_momenta: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
         """Checkerboard pattern in polar (r, phi) coordinates.
 
         10 radial bands x 16 angular sectors, alternating amber and mahogany.
@@ -86,12 +90,16 @@ class AccretionDisk:
         ----------
         hit_points:
             Shape (N, 3).
+        photon_momenta:
+            Ignored; accepted to satisfy the ``EquatorialDisk`` protocol so
+            the same renderer call site works for any disk implementation.
 
         Returns
         -------
         colors:
             Shape (N, 3), linear RGB in [0, 1].
         """
+        del photon_momenta
         x: NDArray[np.float64] = hit_points[:, 0]
         z: NDArray[np.float64] = hit_points[:, 2]
 

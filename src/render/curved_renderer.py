@@ -34,8 +34,26 @@ class EquatorialDisk(Protocol):
     inner_radius: float
     outer_radius: float
 
-    def color(self, hit_points: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Return linear RGB at Cartesian hit points, shape (N, 3)."""
+    def color(
+        self,
+        hit_points: NDArray[np.float64],
+        photon_momenta: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return linear RGB at Cartesian hit points, shape (N, 3).
+
+        ``photon_momenta`` (shape (N, 4), coordinate-basis 4-momentum at the
+        hit) is optional; simple disks may ignore it. Disks that want Doppler
+        / redshift effects use it.
+        """
+        ...
+
+
+@runtime_checkable
+class BackgroundSampler(Protocol):
+    """Sky source queried for rays that escape to infinity."""
+
+    def sample(self, directions: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Map (N, 3) Cartesian unit directions to (N, 3) linear RGB."""
         ...
 
 
@@ -134,7 +152,12 @@ def _build_initial_momenta(
 
 
 def _render_chunk(args: tuple) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
-    """Worker: trace a batch of rays and return (pixel_indices, linear-RGB)."""
+    """Worker: trace a batch of rays and return (pixel_indices, linear-RGB).
+
+    Outcomes are bucketed (disk-hit grouped by which disk, escape, horizon)
+    and each bucket is shaded in one batched call. This keeps Doppler /
+    blackbody / starfield maths off the per-pixel hot path.
+    """
     (
         indices,
         positions,
@@ -144,11 +167,19 @@ def _render_chunk(args: tuple) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
         disk_inner,
         disk_outer,
         background,
+        background_sampler,
     ) = args
 
     n: int = len(indices)
     colors: NDArray[np.float64] = np.tile(background, (n, 1))
     black: NDArray[np.float64] = np.zeros(3, dtype=np.float64)
+
+    disk_locals: list[int] = []
+    disk_obj_idx: list[int] = []
+    disk_carts: list[NDArray[np.float64]] = []
+    disk_moms: list[NDArray[np.float64]] = []
+    escape_locals: list[int] = []
+    escape_dirs: list[NDArray[np.float64]] = []
 
     for i in range(n):
         result = integrator.integrate(
@@ -161,14 +192,45 @@ def _render_chunk(args: tuple) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
         if result.termination == "horizon":
             colors[i] = black
         elif result.termination == "disk":
-            r_hit: float = float(result.final_position[1])
-            for obj in scene_objects:
+            r_hit = float(result.final_position[1])
+            for j, obj in enumerate(scene_objects):
                 if obj.inner_radius <= r_hit <= obj.outer_radius:
-                    theta_hit: float = float(result.final_position[2])
-                    phi_hit: float = float(result.final_position[3])
+                    theta_hit = float(result.final_position[2])
+                    phi_hit = float(result.final_position[3])
                     cart = spherical_to_cartesian(r_hit, theta_hit, phi_hit)
-                    colors[i] = obj.color(cart[np.newaxis, :])[0]
+                    disk_locals.append(i)
+                    disk_obj_idx.append(j)
+                    disk_carts.append(cart)
+                    disk_moms.append(result.final_momentum)
                     break
+        elif result.termination == "escape" and background_sampler is not None:
+            r_f = float(result.final_position[1])
+            th_f = float(result.final_position[2])
+            ph_f = float(result.final_position[3])
+            cart = spherical_to_cartesian(r_f, th_f, ph_f)
+            norm = float(np.linalg.norm(cart))
+            if norm > 0.0:
+                escape_locals.append(i)
+                escape_dirs.append(cart / norm)
+
+    if disk_locals:
+        disk_locals_arr = np.asarray(disk_locals, dtype=np.int64)
+        disk_obj_arr = np.asarray(disk_obj_idx, dtype=np.int64)
+        carts_arr = np.stack(disk_carts)
+        moms_arr = np.stack(disk_moms)
+        for j, obj in enumerate(scene_objects):
+            mask = disk_obj_arr == j
+            if mask.any():
+                colors[disk_locals_arr[mask]] = obj.color(
+                    carts_arr[mask], photon_momenta=moms_arr[mask]
+                )
+
+    if escape_locals:
+        escape_locals_arr = np.asarray(escape_locals, dtype=np.int64)
+        dirs_arr = np.stack(escape_dirs)
+        # background_sampler is non-None inside this branch by construction.
+        assert background_sampler is not None
+        colors[escape_locals_arr] = background_sampler.sample(dirs_arr)
 
     return indices, colors
 
@@ -187,7 +249,12 @@ class CurvedRenderer:
     scene_objects:
         Equatorial disks tested when a geodesic crosses the equatorial plane.
     background_color:
-        Linear RGB for rays that escape to infinity.
+        Linear RGB for rays that escape to infinity when no
+        ``background_sampler`` is provided.
+    background_sampler:
+        Optional sky source (e.g. a ``Starfield``). When set, escape rays are
+        coloured by ``sampler.sample(direction)`` instead of the constant
+        ``background_color``.
     n_workers:
         Worker processes for parallel rendering. ``None`` (default) uses every
         CPU. ``1`` runs serially in the calling process and skips
@@ -204,6 +271,7 @@ class CurvedRenderer:
         integrator: GeodesicIntegrator,
         scene_objects: list[EquatorialDisk],
         background_color: NDArray[np.float64] | None = None,
+        background_sampler: BackgroundSampler | None = None,
         n_workers: int | None = None,
         chunks_per_worker: int = 4,
     ) -> None:
@@ -216,6 +284,7 @@ class CurvedRenderer:
             if background_color is not None
             else np.array([0.02, 0.02, 0.08], dtype=np.float64)
         )
+        self.background_sampler: BackgroundSampler | None = background_sampler
         cpu = os.cpu_count() or 1
         self.n_workers: int = int(n_workers) if n_workers is not None else cpu
         self.chunks_per_worker: int = max(1, int(chunks_per_worker))
@@ -261,6 +330,7 @@ class CurvedRenderer:
                 disk_inner,
                 disk_outer,
                 self.background_color,
+                self.background_sampler,
             )
             for idx in index_chunks
         ]

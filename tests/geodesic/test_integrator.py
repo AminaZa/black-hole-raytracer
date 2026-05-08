@@ -163,7 +163,30 @@ class _FlatStubMetric:
 
 
 def test_integrator_is_metric_agnostic() -> None:
-    """With Γ = 0, momentum is conserved exactly and position evolves linearly."""
+    """With Γ = 0, momentum is conserved and position evolves linearly.
+
+    Uses a small ``p^θ`` so the trajectory never crosses θ = 0 or π — the
+    polar-axis reflection (which is correct physics in spherical coords)
+    would otherwise wrap θ into ``[0, π]`` and flip ``p^θ``.
+    """
+    integrator = GeodesicIntegrator(
+        _FlatStubMetric(), r_max=50.0, base_step=0.5, near_field_factor=1.0
+    )
+    position = np.array([0.0, 10.0, 1.0, 0.5])
+    momentum = np.array([1.0, 0.7, 0.02, 0.1])
+
+    result = integrator.integrate(position, momentum, max_steps=2_000)
+
+    assert np.allclose(result.final_momentum, momentum, atol=1e-12)
+    expected_position = position + result.affine_lambda * momentum
+    assert np.allclose(result.final_position, expected_position, atol=1e-9)
+
+
+def test_polar_axis_reflection_in_flat_space() -> None:
+    """A flat-space ray with ``p^θ > 0`` started near the equator must wrap
+    through the south pole (θ = π) into the equivalent point on the other
+    side: θ in [0, π], φ shifted by π, ``p^θ`` flipped.
+    """
     integrator = GeodesicIntegrator(
         _FlatStubMetric(), r_max=50.0, base_step=0.5, near_field_factor=1.0
     )
@@ -172,6 +195,16 @@ def test_integrator_is_metric_agnostic() -> None:
 
     result = integrator.integrate(position, momentum, max_steps=2_000)
 
-    assert np.allclose(result.final_momentum, momentum, atol=1e-12)
-    expected_position = position + result.affine_lambda * momentum
-    assert np.allclose(result.final_position, expected_position, atol=1e-9)
+    # Naive linear: θ = 1.0 + 58 * 0.2 = 12.6, φ = 0.5 + 58 * 0.1 = 6.3.
+    # 12.6 lies in (4π, 4π + π/2) → two pole crossings, so θ wraps to
+    # 12.6 - 4π ≈ 0.0336 with p^θ unchanged in sign (even number of flips)
+    # and φ shifted by 2π (no observable effect through sin/cos).
+    naive_theta = 1.0 + result.affine_lambda * 0.2
+    n_poles = int(naive_theta // np.pi)
+    expected_theta = naive_theta - n_poles * np.pi
+    if n_poles % 2 == 1:
+        expected_theta = np.pi - expected_theta
+    assert abs(result.final_position[2] - expected_theta) < 1e-9
+    assert 0.0 <= result.final_position[2] <= np.pi
+    expected_p_theta = 0.2 if n_poles % 2 == 0 else -0.2
+    assert abs(result.final_momentum[2] - expected_p_theta) < 1e-12

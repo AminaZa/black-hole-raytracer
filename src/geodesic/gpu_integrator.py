@@ -117,7 +117,9 @@ class GpuGeodesicIntegrator:
         step_far: float = base_step * self.far_field_factor
         rs_3: float = 3.0 * rs
         rs_10: float = 10.0 * rs
-        half_pi: float = 0.5 * float(np.pi)
+        pi_val: float = float(np.pi)
+        half_pi: float = 0.5 * pi_val
+        two_pi: float = 2.0 * pi_val
         check_disk: bool = disk_inner is not None and disk_outer is not None
 
         pos = positions.astype(xp.float64, copy=True)
@@ -150,6 +152,16 @@ class GpuGeodesicIntegrator:
                 step_near,
                 xp.where(r > rs_10, step_far, base_step),
             )
+            # Polar-proximity throttle. The cot(θ) / 1/sin(θ) terms in the
+            # connection diverge at θ = 0, π; without shrinking h there a
+            # single RK4 step can kick p^φ by O(h / sin θ) and corrupt a
+            # thin column of pixels along the polar axis. Scale h linearly
+            # with sin(θ) below sin θ = 0.1 and floor at 1% of nominal so
+            # axis-aligned rays still advance (the post-step reflection
+            # catches the genuine through-pole case).
+            sin_t = xp.abs(xp.sin(pos[:, 2]))
+            pole_factor = xp.maximum(xp.minimum(1.0, sin_t / 0.1), 0.01)
+            h_arr = h_arr * pole_factor
             h_col = h_arr[:, None]
 
             k1 = accel(pos, mom)
@@ -194,6 +206,32 @@ class GpuGeodesicIntegrator:
             mask_live = live_mask[:, None]
             pos = xp.where(mask_live, new_pos, pos)
             mom = xp.where(mask_live, new_mom, mom)
+
+            # Polar-axis reflection. Schwarzschild / Kerr BL Christoffels
+            # carry cot(θ) and 1/sin(θ) terms that diverge at θ = 0 and θ = π;
+            # rays that step across a pole accumulate huge spurious p^φ and
+            # land on a degenerate branch of the chart. Map back to the
+            # physically equivalent point on the other side: θ → -θ (north)
+            # or 2π − θ (south), φ → φ + π, p^θ → -p^θ. φ stays modulo 2π
+            # implicitly — downstream code only uses sin/cos of φ. Disk-hit
+            # rays are frozen at θ = π/2 so they never trigger this branch.
+            theta_now = pos[:, 2]
+            hit_north = theta_now < 0.0
+            hit_south = theta_now > pi_val
+            reflected = hit_north | hit_south
+            theta_fixed = xp.where(hit_north, -theta_now, theta_now)
+            theta_fixed = xp.where(
+                hit_south, two_pi - theta_now, theta_fixed
+            )
+            phi_fixed = xp.where(reflected, pos[:, 3] + pi_val, pos[:, 3])
+            p_theta_fixed = xp.where(reflected, -mom[:, 2], mom[:, 2])
+            pos = xp.stack(
+                [pos[:, 0], pos[:, 1], theta_fixed, phi_fixed], axis=1
+            )
+            mom = xp.stack(
+                [mom[:, 0], mom[:, 1], p_theta_fixed, mom[:, 3]], axis=1
+            )
+
             steps_taken += 1
 
             # Cheap-ish sync: only poll every poll_every iterations.

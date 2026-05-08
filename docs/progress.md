@@ -1,5 +1,72 @@
 # Progress Log
 
+### 2026-05-08 — Polar-axis singularity in the integrator
+
+The "Voronoi-cell" / streak artefacts in the disk renders weren't a
+colour-map problem at all — they were the **spherical-coord polar
+singularity**. The Schwarzschild and Kerr Christoffels carry `cot θ`
+and `1/sin θ` terms that diverge at θ = 0, π, and the GPU integrator
+took fixed RK4 steps right through the +y polar axis above the BH.
+A diagnostic batch traced rays one by one and recorded their minimum
+θ-to-pole distance: rays passing the axis ended up at θ ≈ −504 rad,
+final r ≈ 1e43, with p^φ blown out exponentially by a few `cot(θ)·h`
+kicks. That noise scattered ~36 pixels per axis-crossing column to
+random sky/disk colours — the cellular pattern on screen.
+
+Two coupled fixes in `src/geodesic/gpu_integrator.py` and
+`src/geodesic/integrator.py`:
+
+1. **Polar-proximity throttle.** Per-ray step `h` is multiplied by
+   `max(min(1, sin θ / 0.1), 0.01)`. Below `sin θ = 0.1` the step
+   shrinks linearly with distance to the pole; the 1% floor lets a
+   ray exactly on the axis still advance. Cost: rays that genuinely
+   pass near the pole take ≤ 100× more steps, but those are < 1% of
+   the batch.
+2. **Pole reflection on overshoot.** When a step still puts θ outside
+   `[0, π]` the integrator maps `(θ, φ, p^θ) → (-θ or 2π − θ, φ + π,
+   −p^θ)` — the same physical point on the other branch of the chart.
+
+Diagnostics first ruled out the suspected causes: positions/momenta
+stay `float64` end-to-end, the equatorial crossing is interpolated
+linearly so θ at the recorded hit is pinned to π/2 within 2.2e-16,
+and the r-coordinate of disk hits has no grid quantisation (median
+adjacent diff ≈ 1e-9, min positive diff at machine epsilon). A
+grayscale-of-r render of disk hits was already smooth.
+
+`test_integrator_is_metric_agnostic` had to be loosened: its
+`p^θ = 0.2` over λ = 58 was wrapping θ through π three times, which
+is correct physics now. Added a paired
+`test_polar_axis_reflection_in_flat_space` that *verifies* the wrap.
+All 57 tests pass.
+
+Refreshed cinematic + Kerr + Schwarzschild gallery renders: the
+vertical speckled column above the shadow and the jagged "lip" at
+the top of the lensed arc are gone, the disk gradient is smooth
+through the lensing region, and the BH shadow boundary is clean.
+
+### 2026-05-08 — Smooth blackbody colour map
+
+Disk renders showed faint concentric arcs in the colour gradient. Tracked
+to `src/scene/blackbody.py`: the Tanner Helland piecewise fit has step
+discontinuities at the t = 66 (T = 6600 K) crossover — green snaps from
+~255 to ~251 and blue from ~252 to forced 255. With the smooth radial
+profile `T(r) = T_peak (r_isco/r)^(3/4)` those steps map to fixed-radius
+isotemperature rings.
+
+Replaced the piecewise fit with an analytic Planck × CIE 1931 2° observer
+integration → linear sRGB (D65), per-row normalised so the brightest
+channel sits at 1. The CIE table is sampled at 10 nm steps from 380 to
+780 nm (41 wavelengths); the whole computation is `float64` and `C∞` in
+`T`. Sweeping `T` from 1000 to 40000 K in 9.75 K increments, the maximum
+single-step delta is 0.0025 in any channel — well below the 1/255
+quantisation floor, so no banding survives 8-bit output.
+
+All 15 disk unit tests still pass: inner-pixel-bluer-than-outer, Doppler
+brightening of the approaching side, the `(1/γ)^3` time-dilation ratio,
+and the prograde left/right asymmetry. Reference colours look right too
+— 1500 K deep red, 3000 K incandescent, 6500 K near-white, 12000 K+
+bluish.
+
 ### 2026-05-07 — Phase 6 + 7: animator and fused acceleration
 
 Two interleaved pieces — the animator made the cost of a render frame

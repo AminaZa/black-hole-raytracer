@@ -101,14 +101,25 @@ class GeodesicIntegrator:
         self.far_field_factor: float = float(far_field_factor)
         self._has_fast_accel: bool = hasattr(metric, "acceleration")
 
-    def _step_size(self, r: float) -> float:
-        """Adaptive affine-parameter step size based on radial distance."""
+    def _step_size(self, r: float, theta: float = 0.5 * np.pi) -> float:
+        """Adaptive affine-parameter step size.
+
+        Combines a radial schedule (smaller in the near field, larger in the
+        weak field) with a polar-proximity throttle: scale h by sin(θ) when
+        the ray is near a coordinate pole (cot θ / 1/sin θ in the connection
+        diverge there). Floored at 1% of nominal so axis-aligned rays still
+        advance — the post-step reflection then maps θ back to ``[0, π]``.
+        """
         rs = self.metric.rs
         if r < 3.0 * rs:
-            return self.base_step * self.near_field_factor
-        if r > 10.0 * rs:
-            return self.base_step * self.far_field_factor
-        return self.base_step
+            h = self.base_step * self.near_field_factor
+        elif r > 10.0 * rs:
+            h = self.base_step * self.far_field_factor
+        else:
+            h = self.base_step
+        sin_t = abs(np.sin(theta))
+        pole_factor = max(min(1.0, sin_t / 0.1), 0.01)
+        return h * pole_factor
 
     def _accel(
         self, position: NDArray[np.float64], momentum: NDArray[np.float64]
@@ -196,6 +207,10 @@ class GeodesicIntegrator:
                 h = step_far
             else:
                 h = base_step
+            # Polar-proximity throttle (see _step_size docstring).
+            sin_t_now = abs(float(np.sin(x[2])))
+            pole_factor = max(min(1.0, sin_t_now / 0.1), 0.01)
+            h *= pole_factor
 
             half_h: float = 0.5 * h
             sixth_h: float = h / 6.0
@@ -240,6 +255,22 @@ class GeodesicIntegrator:
                         n_steps=steps_taken,
                         trajectory=(np.array(traj) if traj is not None else None),
                     )
+
+            # Polar-axis reflection. Spherical Christoffels are singular at
+            # θ = 0, π (cot θ, 1/sin θ); rays that step across a pole pick up
+            # huge spurious p^φ. Map back to the physically equivalent point
+            # via (θ, φ) → (-θ or 2π−θ, φ + π) and flip p^θ. φ is consumed by
+            # downstream code only through sin/cos so no modular reduction
+            # is needed.
+            theta_n: float = float(x_next[2])
+            if theta_n < 0.0:
+                x_next[2] = -theta_n
+                x_next[3] += np.pi
+                p_next[2] = -p_next[2]
+            elif theta_n > np.pi:
+                x_next[2] = 2.0 * np.pi - theta_n
+                x_next[3] += np.pi
+                p_next[2] = -p_next[2]
 
             x = x_next
             p = p_next
